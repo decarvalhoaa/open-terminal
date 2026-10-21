@@ -2,9 +2,12 @@ import asyncio
 import hmac
 from importlib.metadata import version as _pkg_version
 import fnmatch
+import heapq
 import json
 import logging
 import tempfile
+from contextlib import asynccontextmanager
+import threading
 
 import aiofiles
 import aiofiles.os
@@ -22,16 +25,20 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import quote as url_quote
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from starlette.formparsers import MultiPartParser, MultiPartException, parse_options_header
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
-from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
-from open_terminal.utils.fs import UserFS
+from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
+from open_terminal.utils.fs import UserFS, FullFileResponse as FileResponse, TemporaryFileResponse, text_file_response, line_range_offsets
+from open_terminal.utils.limits import (CHUNK_SIZE, NormalizeNullQueryMiddleware, run_io, run_worker)
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
+from open_terminal.utils.search import search_entries, matching_files, ranked_page
 from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
 
 MATCH_PAGE_SIZE = 100
@@ -175,42 +182,62 @@ def get_file_browser_root(fs: UserFS) -> dict[str, str] | None:
     return {"path": root_path, "label": label}
 
 
-def _preview_pdf(target: str) -> bytes | None:
+async def _preview_pdf(target: str) -> str | None:
     libreoffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not libreoffice:
         return None
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        command = [
-            libreoffice,
-            "--headless",
-            "--nologo",
-            "--nofirststartwizard",
-            "--nodefault",
-            "--nolockcheck",
-            "--convert-to",
-            "pdf",
-            "--outdir",
-            tmpdir,
-            target,
-        ]
-        subprocess.run(command, check=True, capture_output=True, timeout=60)
-        pdf_path = os.path.join(tmpdir, f"{os.path.splitext(os.path.basename(target))[0]}.pdf")
-        if not os.path.isfile(pdf_path):
-            matches = [name for name in os.listdir(tmpdir) if name.lower().endswith(".pdf")]
+        await run_worker([
+            libreoffice, "--headless", "--nologo", "--nofirststartwizard",
+            "--nodefault", "--nolockcheck", "--convert-to", "pdf", "--outdir", tmpdir, target,
+        ])
+        pdf = os.path.join(tmpdir, os.path.splitext(os.path.basename(target))[0] + ".pdf")
+        if not os.path.isfile(pdf):
+            matches = sorted(name for name in os.listdir(tmpdir) if name.lower().endswith(".pdf"))
             if not matches:
                 return None
-            pdf_path = os.path.join(tmpdir, sorted(matches)[0])
+            pdf = os.path.join(tmpdir, matches[0])
+        fd, result = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            await run_io(shutil.copyfile, pdf, result)
+            return result
+        except BaseException:
+            os.unlink(result)
+            raise
 
-        with open(pdf_path, "rb") as f:
-            return f.read()
+
+@asynccontextmanager
+async def lifespan(app):
+    maintenance = asyncio.create_task(_maintenance_loop())
+    try:
+        yield
+    finally:
+        maintenance.cancel()
+        await asyncio.gather(maintenance, return_exceptions=True)
+        for process in list(_processes.values()):
+            if process.finished_at is None:
+                process.runner.kill(force=True)
+        await asyncio.gather(*(p.log_task for p in _processes.values() if p.log_task), return_exceptions=True)
+        if ENABLE_TERMINAL:
+            for sid in list(_terminal_sessions):
+                await _cleanup_session(sid)
+        if ENABLE_NOTEBOOKS:
+            from open_terminal.utils.notebooks import shutdown_notebooks
+            await shutdown_notebooks()
+        global _port_proxy_client
+        if _port_proxy_client is not None:
+            await _port_proxy_client.aclose()
+            _port_proxy_client = None
 
 
 app = FastAPI(
+    lifespan=lifespan,
     title="Open Terminal",
     description="A remote terminal API.",
     version=_pkg_version("open-terminal"),
 )
+app.add_middleware(NormalizeNullQueryMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in CORS_ALLOWED_ORIGINS.split(",")],
@@ -223,18 +250,6 @@ app.add_middleware(
 @app.exception_handler(PermissionError)
 async def permission_error_handler(request: Request, exc: PermissionError):
     return JSONResponse(status_code=403, content={"detail": str(exc)})
-
-
-@app.middleware("http")
-async def normalize_null_query_params(request: Request, call_next):
-    """Strip query parameters whose value is the literal string 'null'."""
-    from urllib.parse import urlencode
-
-    raw_params = request.query_params.multi_items()
-    cleaned = [(k, v) for k, v in raw_params if v.lower() != "null"]
-    if len(cleaned) != len(raw_params):
-        request.scope["query_string"] = urlencode(cleaned).encode("utf-8")
-    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +372,7 @@ class BackgroundProcess:
     status: str = "running"
     exit_code: Optional[int] = None
     log_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    input_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     finished_at: Optional[float] = field(default=None, repr=False)
     log_path: Optional[str] = field(default=None, repr=False)
     user_id: str = ""
@@ -398,38 +414,53 @@ def _get_session_cwd(session_id: str | None, fs: "UserFS") -> str:
 def _set_session_cwd(session_id: str | None, path: str):
     """Store a session's cwd.  No-op if *session_id* is ``None``."""
     if session_id:
+        _expire_session_cwds()
         _session_cwds[session_id] = (path, time.time())
 
 
-from open_terminal.utils.log import log_process, read_log
+from open_terminal.utils.log import log_process, log_response
 
 
 
 
 def _cleanup_expired():
-    """Remove finished processes that have expired.
-
-    Also deletes log files older than *LOG_RETENTION_SECONDS*.
-    """
     now = time.time()
-    expired = [
-        process_id
-        for process_id, background_process in _processes.items()
-        if background_process.finished_at
-        and now - background_process.finished_at > _EXPIRY_SECONDS
-    ]
-    for process_id in expired:
-        bp = _processes.pop(process_id)
-        # Delete the log file if it has exceeded the retention period.
-        if (
-            bp.log_path
-            and bp.finished_at
-            and now - bp.finished_at > PROCESS_LOG_RETENTION
-        ):
-            try:
-                os.remove(bp.log_path)
-            except OSError:
-                pass
+    finished = [p for p in _processes.values() if p.finished_at is not None]
+    for process in finished:
+        if now - process.finished_at > _EXPIRY_SECONDS:
+            _processes.pop(process.id, None)
+
+
+def _cleanup_log_files(active_paths):
+    directory = os.path.join(LOG_DIR, "processes")
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.path in active_paths or not entry.name.endswith((".jsonl", ".rotating")):
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=False) and time.time() - entry.stat().st_mtime > PROCESS_LOG_RETENTION:
+                        os.unlink(entry.path)
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        pass
+
+
+async def _maintenance_loop():
+    while True:
+        _cleanup_expired()
+        _expire_session_cwds()
+        if ENABLE_TERMINAL:
+            for sid, session in list(_terminal_sessions.items()):
+                if not _session_is_alive(session):
+                    await _cleanup_session(sid)
+        active = {p.log_path for p in _processes.values() if p.finished_at is None}
+        try:
+            await run_io(_cleanup_log_files, active)
+        except OSError as exc:
+            log.warning("Log retention cleanup failed: %s", exc)
+        await asyncio.sleep(60)
 
 
 def _get_process(process_id: str, request: Request) -> BackgroundProcess:
@@ -699,50 +730,35 @@ async def read_file(
     if not await fs.isfile(target):
         raise HTTPException(status_code=404, detail="File not found")
 
+    fs._check_path(target)
     try:
-        content = await fs.read_text(target)
-        lines = content.splitlines(keepends=True)
-    except (UnicodeDecodeError, ValueError):
-        import mimetypes
+        return await text_file_response(target, target, start_line, end_line)
+    except UnicodeDecodeError:
+        pass
 
-        raw = await fs.read(target)
-        mime, _ = mimetypes.guess_type(target)
-        mime = mime or "application/octet-stream"
+    import mimetypes
+    from open_terminal.utils.documents import EXTRACTORS
 
-        # Try document text extraction (PDF, Office, OpenDocument, etc.)
-        from open_terminal.utils.documents import EXTRACTORS
-
-        for ext_mime, ext_suffix, extractor in EXTRACTORS:
-            if (ext_mime and mime == ext_mime) or (
-                ext_suffix and target.lower().endswith(ext_suffix)
-            ):
-                text = await asyncio.to_thread(extractor, target)
-                lines = text.splitlines(keepends=True)
-                start = (start_line or 1) - 1
-                end = end_line or len(lines)
-                return {
-                    "path": target,
-                    "total_lines": len(lines),
-                    "content": "".join(lines[start:end]),
-                }
-
-        # Return raw binary for allowed mime type prefixes (e.g. image/*)
-        if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
-            return Response(content=raw, media_type=mime)
-
-        # Other binary files: reject (LLMs can't interpret raw bytes)
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported binary file type: {mime} ({len(raw)} bytes)",
-        )
-
-    start = (start_line or 1) - 1
-    end = end_line or len(lines)
-    return {
-        "path": target,
-        "total_lines": len(lines),
-        "content": "".join(lines[start:end]),
-    }
+    mime = mimetypes.guess_type(target)[0] or "application/octet-stream"
+    if any(kind and mime == kind or suffix and target.lower().endswith(suffix) for kind, suffix, _ in EXTRACTORS):
+        fd, extracted_path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        try:
+            result = json.loads(await run_worker(
+                [sys.executable, "-m", "open_terminal.utils.documents"],
+                json.dumps({"path": target, "output": extracted_path}).encode(),
+                request=http_request, timeout=None,
+            ))
+            if "error" in result:
+                if result.get("error_type") == "PermissionError":
+                    raise PermissionError(result["error"])
+                raise ValueError(result["error"])
+            return await text_file_response(extracted_path, target, start_line, end_line, False)
+        finally:
+            os.unlink(extracted_path)
+    if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
+        return FileResponse(target, media_type=mime)
+    raise HTTPException(415, f"Unsupported binary file type: {mime} ({os.path.getsize(target)} bytes)")
 
 
 @app.get(
@@ -797,20 +813,21 @@ async def view_file(
         ext = os.path.splitext(target)[1].lower()
         if ext in (".docx", ".pptx"):
             try:
-                pdf = await asyncio.to_thread(_preview_pdf, target)
+                fs._check_path(target)
+                pdf = await _preview_pdf(target)
             except Exception:
                 log.exception("Rendered preview failed for %s", target)
                 pdf = None
 
             if pdf:
-                return Response(content=pdf, media_type="application/pdf")
+                return TemporaryFileResponse(pdf, media_type="application/pdf")
 
     import mimetypes
 
     mime, _ = mimetypes.guess_type(target)
     mime = mime or "application/octet-stream"
-    raw = await fs.read(target)
-    return Response(content=raw, media_type=mime)
+    fs._check_path(target)
+    return FileResponse(target, media_type=mime)
 
 
 @app.get(
@@ -930,10 +947,8 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
 
     for chunk in request.replacements:
         if chunk.start_line or chunk.end_line:
-            lines = content.splitlines(keepends=True)
-            start = (chunk.start_line or 1) - 1
-            end = chunk.end_line or len(lines)
-            search_region = "".join(lines[start:end])
+            start, end = line_range_offsets(content, chunk.start_line, chunk.end_line)
+            search_region = content[start:end]
         else:
             search_region = content
 
@@ -951,8 +966,7 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
 
         if chunk.start_line or chunk.end_line:
             new_region = search_region.replace(chunk.target, chunk.replacement)
-            lines[start:end] = [new_region]
-            content = "".join(lines)
+            content = content[:start] + new_region + content[max(start, end):]
         else:
             content = content.replace(chunk.target, chunk.replacement)
 
@@ -1069,7 +1083,7 @@ async def grep_search(
 
         return matches, truncated
 
-    matches, truncated = await asyncio.to_thread(_search_sync)
+    matches, truncated = await run_io(_search_sync)
     return {
         "query": query,
         "path": target,
@@ -1117,193 +1131,51 @@ async def match_files(
     def _matches_sync():
         query_lower = query.lower()
 
-        def is_hidden_path(candidate: str) -> bool:
-            return any(part.startswith(".") for part in candidate.replace("\\", "/").split("/") if part)
+        def content_lines(path):
+            with open(path, encoding="utf-8", errors="replace", newline="\n" if rg_matches is not None else None) as source:
+                if rg_matches is not None:
+                    yield from enumerate(source, 1)
+                    return
+                number = 0
+                for line in source:
+                    for text in line.splitlines():
+                        number += 1
+                        yield number, text
 
-        def content_match(text: str, line: int) -> dict | None:
-            text = text.rstrip("\r\n")
-            index = text.lower().find(query_lower)
-            if index < 0:
-                return None
-            column = len(text[:index].encode("utf-16-le")) // 2 + 1
-            return {"line": line, "column": column, "text": text}
-
-        def walk_entries() -> list[tuple[str, str]]:
-            try:
-                git_result = subprocess.run(
-                    ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
-                    check=False,
-                    capture_output=True,
-                )
-            except OSError:
-                git_result = None
-
-            if git_result and git_result.returncode == 0:
-                git_entries = []
-                seen = set()
-                for raw in git_result.stdout.split(b"\0"):
-                    if not raw:
-                        continue
-                    rel_path = os.fsdecode(raw)
-                    if not show_hidden and is_hidden_path(rel_path):
-                        continue
-                    full_path = os.path.normpath(os.path.join(target, rel_path))
-                    if not fs.is_path_allowed(full_path):
-                        continue
-                    parent_rel = os.path.dirname(rel_path)
-                    while parent_rel and parent_rel != ".":
-                        if show_hidden or not is_hidden_path(parent_rel):
-                            directory = os.path.normpath(os.path.join(target, parent_rel))
-                            if directory not in seen and fs.is_path_allowed(directory):
-                                seen.add(directory)
-                                git_entries.append((directory, "directory"))
-                        parent_rel = os.path.dirname(parent_rel)
-                    if full_path not in seen:
-                        seen.add(full_path)
-                        git_entries.append((full_path, "directory" if os.path.isdir(full_path) else "file"))
-                return sorted(git_entries, key=lambda item: os.path.relpath(item[0], target).lower())
-
-            entries = []
-            for dirpath, dirnames, filenames in os.walk(target):
-                dirnames[:] = [
-                    d
-                    for d in sorted(dirnames)
-                    if (show_hidden or not d.startswith("."))
-                    and fs.is_path_allowed(os.path.join(dirpath, d))
-                ]
-                for name in dirnames:
-                    entries.append((os.path.join(dirpath, name), "directory"))
-                for name in sorted(filenames):
-                    if show_hidden or not name.startswith("."):
-                        full_path = os.path.join(dirpath, name)
-                        if fs.is_path_allowed(full_path):
-                            entries.append((full_path, "file"))
-            return entries
-
-        def content_matches_with_rg(files: set[str]) -> dict[str, list[dict]] | None:
-            rg = shutil.which("rg")
-            if not rg:
-                return None
-            args = [
-                rg,
-                "--json",
-                "--no-messages",
-                "--fixed-strings",
-                "--ignore-case",
-                "--line-number",
-                "--column",
-                "--max-count",
-                str(MAX_CONTENT_MATCHES_PER_FILE + 1),
-            ]
-            if show_hidden:
-                args.append("--hidden")
-            args.extend(("--", query, target))
-            try:
-                completed = subprocess.run(args, capture_output=True, text=True, check=False)
-            except OSError:
-                return None
-            if completed.returncode not in (0, 1):
-                return None
-
-            matches: dict[str, list[dict]] = {}
-            for raw in completed.stdout.splitlines():
-                try:
-                    message = json.loads(raw)
-                except json.JSONDecodeError:
+        def candidates():
+            for entry_path, entry_type in search_entries(fs, target, show_hidden):
+                rel_path = os.path.relpath(entry_path, target).replace("\\", "/")
+                name = os.path.basename(entry_path)
+                name_lower, rel_lower = name.lower(), rel_path.lower()
+                score = (0 if name_lower == query_lower else 1 if name_lower.startswith(query_lower)
+                    else 2 if query_lower in name_lower else 3 if query_lower in rel_lower else 4)
+                content_matches = []
+                if entry_type == "file" and not os.path.islink(entry_path):
+                    try:
+                        size = os.path.getsize(entry_path)
+                        eligible = rg_matches(entry_path) if rg_matches is not None else size <= MAX_CONTENT_SEARCH_FILE_SIZE
+                        if eligible:
+                            with open(entry_path, "rb") as source:
+                                binary = rg_matches is None and b"\0" in source.read(8192)
+                            for number, text in (() if binary else content_lines(entry_path)):
+                                index = text.lower().find(query_lower)
+                                if index >= 0:
+                                    content_matches.append({"line": number, "column": len(text[:index].encode("utf-16-le")) // 2 + 1, "text": text.rstrip("\r\n")})
+                                    if len(content_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
+                                        break
+                    except (OSError, UnicodeError):
+                        pass
+                if score == 4 and not content_matches:
                     continue
-                if message.get("type") != "match":
-                    continue
-                data = message["data"]
-                path = os.path.normpath(data["path"]["text"])
-                if path not in files:
-                    continue
-                line_matches = matches.setdefault(path, [])
-                if len(line_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
-                    continue
-                match = content_match(data["lines"]["text"], data["line_number"])
-                if match:
-                    line_matches.append(match)
-            return matches
+                yield (score, len(rel_path), rel_lower, {
+                    "path": entry_path, "relative_path": rel_path, "name": name,
+                    "type": entry_type, "name_match": score < 4, "content_matches": content_matches,
+                })
 
-        def content_matches_with_python(files: set[str]) -> dict[str, list[dict]]:
-            matches: dict[str, list[dict]] = {}
-            for file_path in files:
-                try:
-                    if os.path.getsize(file_path) > MAX_CONTENT_SEARCH_FILE_SIZE:
-                        continue
-                    with open(file_path, "rb") as source:
-                        if b"\0" in source.read(8192):
-                            continue
-                    with open(file_path, "r", encoding="utf-8", errors="replace") as source:
-                        lines = source.read().splitlines()
-                except OSError:
-                    continue
+        with matching_files(query, target, show_hidden) as rg_matches:
+            return ranked_page(candidates(), offset, limit)
 
-                for number, text in enumerate(lines, start=1):
-                    match = content_match(text, number)
-                    if not match:
-                        continue
-                    file_matches = matches.setdefault(file_path, [])
-                    if len(file_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
-                        break
-                    file_matches.append(match)
-            return matches
-
-        entries = walk_entries()
-        files = {
-            os.path.normpath(entry_path)
-            for entry_path, entry_type in entries
-            if entry_type == "file" and not os.path.islink(entry_path)
-        }
-        content_matches = content_matches_with_rg(files)
-        if content_matches is None:
-            content_matches = content_matches_with_python(files)
-
-        matches = []
-        for entry_path, entry_type in entries:
-            rel_path = os.path.relpath(entry_path, target).replace("\\", "/")
-            name = os.path.basename(entry_path)
-            name_lower = name.lower()
-            rel_lower = rel_path.lower()
-            if name_lower == query_lower:
-                score = 0
-            elif name_lower.startswith(query_lower):
-                score = 1
-            elif query_lower in name_lower:
-                score = 2
-            elif query_lower in rel_lower:
-                score = 3
-            else:
-                score = 4
-
-            entry_content_matches = content_matches.get(os.path.normpath(entry_path), []) if entry_type == "file" else []
-            name_match = score < 4
-            if not name_match and not entry_content_matches:
-                continue
-            matches.append(
-                (
-                    score,
-                    len(rel_path),
-                    rel_lower,
-                    {
-                        "path": entry_path,
-                        "relative_path": rel_path,
-                        "name": name,
-                        "type": entry_type,
-                        "name_match": name_match,
-                        "content_matches": entry_content_matches,
-                    },
-                )
-            )
-
-        matches.sort(key=lambda item: (item[0], item[1], item[2]))
-        next_offset = offset + limit if offset + limit < len(matches) else None
-        return {
-            "results": [item[3] for item in matches[offset : offset + limit]],
-            "next_offset": next_offset,
-        }
-
-    return await asyncio.to_thread(_matches_sync)
+    return await run_io(_matches_sync)
 
 
 @app.get(
@@ -1338,106 +1210,25 @@ async def search_files(
 
     def _search_sync():
         query_lower = query.strip().lower()
-        candidates = []
-        seen = set()
-
-        try:
-            git_result = subprocess.run(
-                ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
-                check=False,
-                capture_output=True,
-            )
-        except OSError:
-            git_result = None
-
-        if git_result and git_result.returncode == 0:
-            for raw in git_result.stdout.split(b"\0"):
-                if not raw:
+        def candidates():
+            for full_path, entry_type in search_entries(fs, target, show_hidden, git_files_as_files=True):
+                if type != "any" and entry_type != type:
                     continue
-                rel_path = os.fsdecode(raw)
-                parts = rel_path.replace("\\", "/").split("/")
-                if not show_hidden and any(part.startswith(".") for part in parts):
+                name = os.path.basename(full_path)
+                lower = name.lower()
+                if query_lower and query_lower not in lower:
                     continue
+                rank = 0 if lower == query_lower else 1 if lower.startswith(query_lower) else 2
+                try:
+                    info = os.stat(full_path)
+                except OSError:
+                    continue
+                yield (rank, len(name), os.path.relpath(full_path, target).lower(), {
+                    "path": full_path, "name": name, "type": entry_type, "size": info.st_size, "modified": info.st_mtime,
+                })
+        return [item[3] for item in heapq.nsmallest(limit, candidates(), key=lambda item: item[:3])]
 
-                full_path = os.path.normpath(os.path.join(target, rel_path))
-                if type in ("any", "file") and full_path not in seen:
-                    seen.add(full_path)
-                    candidates.append((full_path, "file"))
-
-                if type in ("any", "directory"):
-                    parent_rel = os.path.dirname(rel_path)
-                    while parent_rel and parent_rel != ".":
-                        if show_hidden or not any(
-                            part.startswith(".") for part in parent_rel.replace("\\", "/").split("/")
-                        ):
-                            directory = os.path.normpath(os.path.join(target, parent_rel))
-                            if directory not in seen:
-                                seen.add(directory)
-                                candidates.append((directory, "directory"))
-                        parent_rel = os.path.dirname(parent_rel)
-        else:
-            for dirpath, dirnames, filenames in os.walk(target):
-                dirnames[:] = [
-                    d
-                    for d in dirnames
-                    if (show_hidden or not d.startswith("."))
-                    and fs.is_path_allowed(os.path.join(dirpath, d))
-                ]
-
-                if type in ("any", "directory"):
-                    for name in dirnames:
-                        full_path = os.path.join(dirpath, name)
-                        if full_path not in seen:
-                            seen.add(full_path)
-                            candidates.append((full_path, "directory"))
-
-                if type in ("any", "file"):
-                    for name in filenames:
-                        if not show_hidden and name.startswith("."):
-                            continue
-                        full_path = os.path.join(dirpath, name)
-                        if full_path not in seen:
-                            seen.add(full_path)
-                            candidates.append((full_path, "file"))
-
-        matches = []
-        for full_path, entry_type in candidates:
-            if not fs.is_path_allowed(full_path):
-                continue
-
-            name = os.path.basename(full_path)
-            name_lower = name.lower()
-            if query_lower and query_lower in name_lower:
-                rank = 0 if name_lower == query_lower else 1 if name_lower.startswith(query_lower) else 2
-            elif not query_lower:
-                rank = 2
-            else:
-                continue
-
-            try:
-                file_stat = os.stat(full_path)
-            except OSError:
-                continue
-
-            matches.append(
-                (
-                    rank,
-                    len(name),
-                    os.path.relpath(full_path, target).lower(),
-                    {
-                        "path": full_path,
-                        "name": name,
-                        "type": entry_type,
-                        "size": file_stat.st_size,
-                        "modified": file_stat.st_mtime,
-                    },
-                )
-            )
-
-        matches.sort(key=lambda item: (item[0], item[1], item[2]))
-        return [item[3] for item in matches[:limit]]
-
-    return {"results": await asyncio.to_thread(_search_sync)}
+    return {"results": await run_io(_search_sync)}
 
 
 @app.get(
@@ -1533,7 +1324,7 @@ async def glob_search(
 
         return matches, truncated
 
-    matches, truncated = await asyncio.to_thread(_glob_sync)
+    matches, truncated = await run_io(_glob_sync)
     return {
         "pattern": pattern,
         "path": target,
@@ -1541,6 +1332,19 @@ async def glob_search(
         "truncated": truncated,
     }
 
+
+
+
+class UploadParser(MultiPartParser):
+    async def parse(self):
+        try:
+            return await super().parse()
+        except BaseException:
+            # Starlette closes these on MultiPartException only. Disconnects,
+            # cancellation and other read errors must release spools as well.
+            for file in self._files_to_close_on_error:
+                file.close()
+            raise
 
 
 
@@ -1556,26 +1360,48 @@ async def glob_search(
     },
 )
 async def upload_file(
+    http_request: Request,
     directory: str = Query(..., description="Destination directory for the file."),
-    file: UploadFile = File(
-        ..., description="The file to upload."
-    ),
     fs: UserFS = Depends(get_filesystem),
 ):
-    content = await file.read()
+    try:
+        content_type, _ = parse_options_header(http_request.headers.get("content-type"))
+        if content_type == b"multipart/form-data":
+            form = await UploadParser(http_request.headers, http_request.stream()).parse()
+        else:
+            form = await http_request.form()
+    except MultiPartException as exc:
+        raise HTTPException(400, exc.message) from None
+    file = form.get("file")
+    try:
+        if file is None or file == "":
+            raise RequestValidationError([{"type": "missing", "loc": ("body", "file"), "msg": "Field required", "input": None}])
+        file = TypeAdapter(UploadFile).validate_python(file)
+    except ValidationError as exc:
+        await form.close()
+        raise RequestValidationError([{**error, "loc": ("body", "file", *error["loc"])} for error in exc.errors(include_url=False)]) from exc
+    except BaseException:
+        await form.close()
+        raise
     filename = os.path.basename(file.filename or "upload")
-
     directory = fs.resolve_path(directory)
     path = os.path.normpath(os.path.join(directory, filename))
-
+    size = 0
     try:
+        fs._check_path(path)
         await fs.mkdir(directory)
-        await fs.write_bytes(path, content)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except OSError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"path": path, "size": len(content)}
+        async with aiofiles.open(path, "wb") as output:
+            while chunk := await file.read(CHUNK_SIZE):
+                size += len(chunk)
+                await output.write(chunk)
+        await fs._chown(path)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc))
+    except OSError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        await form.close()
+    return {"path": path, "size": size}
 
 
 class ArchiveRequest(BaseModel):
@@ -1595,7 +1421,6 @@ async def archive_paths(
     fs: UserFS = Depends(get_filesystem),
 ):
     """Bundle files and/or directories into a single ZIP archive."""
-    import io
     import zipfile
 
     if not request.paths:
@@ -1614,37 +1439,46 @@ async def archive_paths(
     else:
         archive_name = "download"
 
-    def _build_zip() -> bytes:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for target in resolved:
-                if os.path.isfile(target):
-                    zf.write(target, os.path.basename(target))
-                elif os.path.isdir(target):
-                    dirname = os.path.basename(target.rstrip("/\\")) or "dir"
-                    for dirpath, dirnames, filenames in os.walk(target):
-                        dirnames[:] = [
-                            d for d in dirnames
-                            if fs.is_path_allowed(os.path.join(dirpath, d))
-                        ]
-                        for fname in filenames:
-                            full = os.path.join(dirpath, fname)
-                            if not fs.is_path_allowed(full):
-                                continue
-                            arcname = os.path.join(
-                                dirname, os.path.relpath(full, target)
-                            )
-                            zf.write(full, arcname)
-        return buf.getvalue()
+    fd, temporary = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    stop = threading.Event()
 
-    data = await asyncio.to_thread(_build_zip)
-    return Response(
-        content=data,
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{archive_name}.zip"',
-        },
-    )
+    def archive_files(target):
+        if os.path.isfile(target):
+            yield target
+        elif os.path.isdir(target):
+            for directory, dirs, files in os.walk(target):
+                dirs[:] = [name for name in dirs if fs.is_path_allowed(os.path.join(directory, name))]
+                for name in files:
+                    full = os.path.join(directory, name)
+                    if fs.is_path_allowed(full):
+                        yield full
+
+    def _build_zip():
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+            for target in resolved:
+                fs._check_path(target)
+                for full in archive_files(target):
+                    if stop.is_set():
+                        return
+                    arcname = os.path.basename(full) if full == target else os.path.join(os.path.basename(target.rstrip("/\\")) or "dir", os.path.relpath(full, target))
+                    info = zipfile.ZipInfo.from_file(full, arcname)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    with open(full, "rb") as source, archive.open(info, "w") as destination:
+                        while chunk := source.read(CHUNK_SIZE):
+                            if stop.is_set():
+                                return
+                            destination.write(chunk)
+
+    task = asyncio.create_task(asyncio.to_thread(_build_zip))
+    try:
+        await asyncio.shield(task)
+        return TemporaryFileResponse(temporary, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{archive_name}.zip"'})
+    except BaseException:
+        stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+        os.unlink(temporary)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1703,15 +1537,14 @@ async def execute(
         ge=1,
     ),
 ):
+    _cleanup_expired()
     fs = get_filesystem(http_request)
     session_id = http_request.headers.get("x-session-id")
     session_cwd = _get_session_cwd(session_id, fs) if session_id else None
     cwd = fs.resolve_path(request.cwd, cwd=session_cwd) if request.cwd else (session_cwd or fs.home)
 
     subprocess_env = {**os.environ, **request.env} if request.env else None
-    runner = await create_runner(
-        request.command, cwd, subprocess_env, run_as_user=fs.username
-    )
+    runner = await create_runner(request.command, cwd, subprocess_env, run_as_user=fs.username)
 
     process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
@@ -1733,21 +1566,14 @@ async def execute(
         except asyncio.TimeoutError:
             pass
 
-    output, next_offset, truncated = await read_log(
-        background_process.log_path, offset=0, tail=tail
-    )
-
-    return {
+    return await log_response(background_process.log_path, {
         "id": process_id,
         "command": request.command,
         "cwd": cwd,
         "status": background_process.status,
         "exit_code": background_process.exit_code,
-        "output": output,
-        "truncated": truncated,
-        "next_offset": next_offset,
         "log_path": background_process.log_path,
-    }
+    }, offset=0, tail=tail)
 
 
 @app.get(
@@ -1793,20 +1619,13 @@ async def get_status(
         except asyncio.TimeoutError:
             pass
 
-    output, next_offset, truncated = await read_log(
-        background_process.log_path, offset=offset, tail=tail
-    )
-
-    return {
+    return await log_response(background_process.log_path, {
         "id": background_process.id,
         "command": background_process.command,
         "status": background_process.status,
         "exit_code": background_process.exit_code,
-        "output": output,
-        "truncated": truncated,
-        "next_offset": next_offset,
         "log_path": background_process.log_path,
-    }
+    }, offset=offset, tail=tail)
 
 
 @app.post(
@@ -1831,9 +1650,13 @@ async def send_input(process_id: str, body: InputRequest, http_request: Request)
     text = body.input.encode("raw_unicode_escape").decode("unicode_escape")
 
     try:
-        background_process.runner.write_input(text.encode())
-        if isinstance(background_process.runner, PipeRunner):
-            await background_process.runner.drain_input()
+        async with background_process.input_lock:
+            if isinstance(background_process.runner, PtyRunner):
+                await write_pty(background_process.runner._master_fd, text.encode())
+            else:
+                background_process.runner.write_input(text.encode())
+            if isinstance(background_process.runner, PipeRunner):
+                await background_process.runner.drain_input()
     except (BrokenPipeError, ConnectionResetError, OSError):
         raise HTTPException(status_code=400, detail="Process stdin is closed")
 
@@ -1860,10 +1683,8 @@ async def kill_process(
     if background_process.status == "running":
         background_process.status = "killed"
         background_process.runner.kill(force=force)
-        exit_code = await background_process.runner.wait()
-        background_process.runner.close()
-        background_process.status = "killed"
-        background_process.exit_code = exit_code
+        # The log task owns draining, reaping and closing the runner.
+        await asyncio.shield(background_process.log_task)
     background_process.finished_at = time.time()
     return {"status": "killed"}
 
@@ -1876,7 +1697,7 @@ from open_terminal.utils.port import detect_listening_ports, get_descendant_pids
 
 
 async def _visible_ports(request: Request) -> list[dict]:
-    all_ports = await asyncio.to_thread(detect_listening_ports)
+    all_ports = await run_io(detect_listening_ports)
 
     try:
         fs = get_filesystem(request)
@@ -1895,7 +1716,7 @@ async def _visible_ports(request: Request) -> list[dict]:
             return []
 
     own_pid = os.getpid()
-    descendant_pids = await asyncio.to_thread(get_descendant_pids, own_pid)
+    descendant_pids = await run_io(get_descendant_pids, own_pid)
     return [p for p in all_ports if p.get("pid") in descendant_pids]
 
 
@@ -1957,18 +1778,14 @@ async def port_proxy(port: int, path: str, request: Request):
     for h in ("host", "transfer-encoding", "connection", "authorization"):
         headers.pop(h, None)
 
-    body = await request.body()
-
     import httpx
 
     client = await _get_port_proxy_client()
     try:
-        upstream = await client.request(
-            method=request.method,
-            url=target_url,
-            headers=headers,
-            content=body or None,
+        upstream_request = client.build_request(
+            method=request.method, url=target_url, headers=headers, content=request.stream(),
         )
+        upstream = await client.send(upstream_request, stream=True)
     except httpx.ConnectError:
         raise HTTPException(
             status_code=502,
@@ -1984,11 +1801,14 @@ async def port_proxy(port: int, path: str, request: Request):
     for h in ("transfer-encoding", "connection", "content-encoding", "content-length"):
         response_headers.pop(h, None)
 
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=response_headers,
-    )
+    class ProxyResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                await upstream.aclose()
+
+    return ProxyResponse(upstream.aiter_bytes(), status_code=upstream.status_code, headers=response_headers)
 
 
 # ---------------------------------------------------------------------------
@@ -2000,11 +1820,6 @@ if ENABLE_TERMINAL:
     import uuid as _uuid
     from datetime import datetime as _datetime
     from fastapi.responses import JSONResponse
-
-    try:
-        import select as _select
-    except ImportError:
-        _select = None  # Not available on all platforms in all contexts
 
     # Determine terminal backend: prefer Unix PTY, then pywinpty, else None
     if _PTY_AVAILABLE:
@@ -2021,7 +1836,7 @@ if ENABLE_TERMINAL:
     _terminal_sessions: dict[str, dict] = {}
 
 
-    def _cleanup_session(session_id: str):
+    async def _cleanup_session(session_id: str):
         """Clean up a terminal session's resources.
 
         For PTY sessions the shell is spawned with ``start_new_session=True``,
@@ -2033,6 +1848,11 @@ if ENABLE_TERMINAL:
         if session is None:
             return
 
+        tasks = session.get("io_tasks", ())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
         backend = session.get("backend")
 
         if backend == "pty":
@@ -2042,21 +1862,21 @@ if ENABLE_TERMINAL:
                 pass
 
             process = session["process"]
-            if process.poll() is None:
-                # Signal the whole process group first (graceful).
+            # The leader may have exited while background children remain.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                await asyncio.to_thread(process.wait, timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
+                    os.killpg(process.pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    # Forceful kill of the entire group.
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                    process.wait()
+                await asyncio.to_thread(process.wait)
 
         elif backend == "winpty":
             pty_proc = session["pty_process"]
@@ -2079,7 +1899,7 @@ if ENABLE_TERMINAL:
         else:
             dead = [sid for sid, s in _terminal_sessions.items() if not s["pty_process"].isalive()]
         for sid in dead:
-            _cleanup_session(sid)
+            await _cleanup_session(sid)
 
         if len(_terminal_sessions) >= MAX_TERMINAL_SESSIONS:
             return JSONResponse(
@@ -2204,12 +2024,7 @@ if ENABLE_TERMINAL:
     async def _write_terminal(session: dict, data: bytes):
         async with session["input_lock"]:
             if session["backend"] == "pty":
-                while data:
-                    try:
-                        written = os.write(session["master_fd"], data)
-                        data = data[written:]
-                    except BlockingIOError:
-                        await asyncio.sleep(0.01)
+                await write_pty(session["master_fd"], data)
             else:
                 await asyncio.to_thread(session["pty_process"].write, data.decode(errors="replace"))
 
@@ -2252,7 +2067,7 @@ if ENABLE_TERMINAL:
                 "pid": session["pid"],
             })
         for sid in to_remove:
-            _cleanup_session(sid)
+            await _cleanup_session(sid)
         return result
 
 
@@ -2263,7 +2078,7 @@ if ENABLE_TERMINAL:
         if session is None or not _owns_terminal(session, request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
         if not _session_is_alive(session):
-            _cleanup_session(session_id)
+            await _cleanup_session(session_id)
             return JSONResponse({"error": "Session not found"}, status_code=404)
         return {
             "id": session_id,
@@ -2277,7 +2092,7 @@ if ENABLE_TERMINAL:
         """Kill and remove a terminal session."""
         if session_id not in _terminal_sessions or not _owns_terminal(_terminal_sessions[session_id], request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
-        _cleanup_session(session_id)
+        await _cleanup_session(session_id)
         return {"status": "deleted"}
 
 
@@ -2304,7 +2119,7 @@ if ENABLE_TERMINAL:
             return
 
         if not _session_is_alive(session):
-            _cleanup_session(session_id)
+            await _cleanup_session(session_id)
             await ws.close(code=4004, reason="Session has ended")
             return
 
@@ -2341,20 +2156,6 @@ if ENABLE_TERMINAL:
             master_fd = session["master_fd"]
             process = session["process"]
 
-            def _blocking_read():
-                """Read from PTY using select() so we don't block forever."""
-                while not stop_event.is_set():
-                    try:
-                        rlist, _, _ = _select.select([master_fd], [], [], 0.1)
-                        if rlist:
-                            return os.read(master_fd, 4096)
-                    except (OSError, ValueError):
-                        return b""
-                return b""
-
-            def _check_alive():
-                return process.poll() is None
-
             def _do_resize(rows: int, cols: int):
                 fcntl.ioctl(
                     master_fd,
@@ -2375,9 +2176,6 @@ if ENABLE_TERMINAL:
                 except Exception:
                     return b""
 
-            def _check_alive():
-                return pty_proc.isalive()
-
             def _do_resize(rows: int, cols: int):
                 pty_proc.setwinsize(rows, cols)
 
@@ -2385,27 +2183,15 @@ if ENABLE_TERMINAL:
 
         async def _pty_reader():
             """Forward PTY output -> WebSocket."""
-            try:
-                while not stop_event.is_set():
-                    data = await loop.run_in_executor(None, _blocking_read)
-                    if not data:
-                        if stop_event.is_set():
-                            break
-                        if not _check_alive():
-                            break
-                        continue
-                    try:
-                        session["output"].extend(data)
-                        del session["output"][:-65536]
-                        await ws.send_bytes(data)
-                    except Exception:
-                        break
-            finally:
-                pass
+            while not stop_event.is_set():
+                data = await read_pty(master_fd) if backend == "pty" else await loop.run_in_executor(None, _blocking_read)
+                if not data:
+                    break
+                session["output"].extend(data)
+                del session["output"][:-65536]
+                await ws.send_bytes(data)
 
-        reader_task = asyncio.create_task(_pty_reader())
-
-        try:
+        async def _ws_reader():
             while True:
                 msg = await ws.receive()
                 if msg["type"] == "websocket.disconnect":
@@ -2421,17 +2207,20 @@ if ENABLE_TERMINAL:
                             _do_resize(rows, cols)
                     except (json.JSONDecodeError, KeyError):
                         pass
-        except WebSocketDisconnect:
-            pass
+        tasks = (asyncio.create_task(_pty_reader()), asyncio.create_task(_ws_reader()))
+        session["io_tasks"] = tasks
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             stop_event.set()
-            reader_task.cancel()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await _cleanup_session(session_id)
             try:
-                await reader_task
-            except (asyncio.CancelledError, Exception):
+                await ws.close()
+            except (WebSocketDisconnect, RuntimeError):
                 pass
-            # Clean up session on disconnect
-            _cleanup_session(session_id)
 
 
 # ---------------------------------------------------------------------------

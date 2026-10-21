@@ -1,13 +1,15 @@
 """Read-only text comparison. Workers receive structured input on stdin."""
 
-import asyncio
 import difflib
+import io
 import json
 import mimetypes
 import os
 from pathlib import Path
 import re
 import sys
+
+from open_terminal.utils.limits import run_worker
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -23,6 +25,14 @@ TIMEOUT_SECONDS = 60
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
 MAX_LINES = 50_000
+
+
+class ComparisonText(io.StringIO):
+    def write(self, text):
+        # CRLF normalization can halve the length; enforce the exact limit below.
+        if self.tell() + len(text) > 2 * MAX_TEXT_CHARS:
+            raise ValueError("Extracted text exceeds the comparison limit (2 million characters / 50,000 lines). Nothing was truncated.")
+        return super().write(text)
 
 
 class CompareRequest(BaseModel):
@@ -47,7 +57,12 @@ def extract(path):
             None,
         )
         if extractor:
-            if extractor in (extract_pdf, extract_epub):
+            if hasattr(extractor, "write_to"):
+                output = ComparisonText()
+                options = {"strict": True} if extractor in (extract_pdf, extract_epub) else {}
+                extractor.write_to(path, output, **options)
+                text = output.getvalue()
+            elif extractor in (extract_pdf, extract_epub):
                 text = extractor(path, strict=True)
             else:
                 text = extractor(path)
@@ -89,11 +104,15 @@ def extract(path):
             if any(ord(c) < 32 and c not in "\n\r\t\f" for c in text):
                 raise ValueError("Unsupported binary file.")
         text = text.replace("\r\n", "\n").replace("\r", "\n")
-        lines = text.splitlines()
-        if len(text) > MAX_TEXT_CHARS or len(lines) > MAX_LINES:
+        if len(text) > MAX_TEXT_CHARS:
+            raise ValueError("Extracted text exceeds the comparison limit (2 million characters / 50,000 lines). Nothing was truncated.")
+        line_breaks = "\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+        line_count = sum(1 for _ in re.finditer("[" + line_breaks + "]", text)) + bool(text and text[-1] not in line_breaks)
+        if line_count > MAX_LINES:
             raise ValueError(
                 "Extracted text exceeds the comparison limit (2 million characters / 50,000 lines). Nothing was truncated."
             )
+        lines = text.splitlines()
         return {"path": path, "name": name, "notices": notices}, lines
     except Exception as exc:
         raise ValueError(f"{name}: {exc}") from exc
@@ -213,63 +232,23 @@ async def run_comparison(request, payload, fs, cwd=None):
             }
         else:
             command = ["sudo", "-n", "-u", fs.username, "--", *command]
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **process_options,
-    )
-    task = asyncio.create_task(
-        process.communicate(
-            json.dumps(
-                {
-                    "original": paths[0],
-                    "revised": paths[1],
-                    "ignore_whitespace": payload.ignore_whitespace,
-                }
-            ).encode()
-        )
-    )
-
-    async def disconnected():
-        # A blocking receive also works through Starlette's BaseHTTPMiddleware;
-        # is_disconnected() uses an immediately cancelled receive there.
-        while (await request.receive())["type"] != "http.disconnect":
-            pass
-
-    disconnect = asyncio.create_task(disconnected())
     try:
-        done, _ = await asyncio.wait(
-            {task, disconnect},
-            timeout=TIMEOUT_SECONDS,
-            return_when=asyncio.FIRST_COMPLETED,
+        stdout = await run_worker(
+            command,
+            json.dumps({"original": paths[0], "revised": paths[1], "ignore_whitespace": payload.ignore_whitespace}).encode(),
+            request=request, timeout=TIMEOUT_SECONDS, **process_options,
         )
-        if not done:
-            raise TimeoutError()
-        if disconnect in done:
-            raise HTTPException(499, "Comparison cancelled.")
-        stdout, stderr = await task
-        if process.returncode:
-            raise HTTPException(
-                422,
-                "Comparison failed. Check that the document libraries are installed and the files are readable.",
-            )
-        result = json.loads(stdout)
-        if "error" in result:
-            raise HTTPException(422, result["error"])
-        return result
-    except TimeoutError as exc:
-        raise HTTPException(
-            408, "Comparison exceeded the 60 second limit. Try smaller files."
-        ) from exc
-    finally:
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
-        task.cancel()
-        disconnect.cancel()
-        await asyncio.gather(task, disconnect, return_exceptions=True)
+    except HTTPException as exc:
+        messages = {
+            408: "Comparison exceeded the 60 second limit. Try smaller files.",
+            422: "Comparison failed. Check that the document libraries are installed and the files are readable.",
+            499: "Comparison cancelled.",
+        }
+        raise HTTPException(exc.status_code, messages.get(exc.status_code, exc.detail)) from exc
+    result = json.loads(stdout)
+    if "error" in result:
+        raise HTTPException(422, result["error"])
+    return result
 
 
 if __name__ == "__main__":

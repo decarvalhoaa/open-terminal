@@ -62,19 +62,40 @@ async def _idle_cleanup_loop():
             await _destroy_session(sid)
 
 
-async def _destroy_session(session_id: str):
-    session = _sessions.pop(session_id, None)
-    if session and session.client:
+async def _close_client(client):
+    try:
+        await client._async_cleanup_kernel()
+    except Exception:
+        # A failed handshake can leave only the manager initialized.
         try:
-            await session.client._async_cleanup_kernel()
+            if client.km and await client.km.is_alive():
+                await client.km.shutdown_kernel(now=True)
         except Exception:
             pass
+        finally:
+            if client.kc:
+                client.kc.stop_channels()
+
+
+async def _destroy_session(session_id):
+    session = _sessions.pop(session_id, None)
+    if session and session.client:
+        await _close_client(session.client)
 
 
 def _ensure_cleanup_task():
     global _cleanup_task
     if _cleanup_task is None or _cleanup_task.done():
         _cleanup_task = asyncio.create_task(_idle_cleanup_loop())
+
+
+async def shutdown_notebooks():
+    global _cleanup_task
+    if _cleanup_task:
+        _cleanup_task.cancel()
+        await asyncio.gather(_cleanup_task, return_exceptions=True)
+        _cleanup_task = None
+    await asyncio.gather(*(_destroy_session(sid) for sid in list(_sessions)), return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +182,10 @@ def create_notebooks_router(verify_api_key) -> APIRouter:
             client.create_kernel_manager()
             await client.async_start_new_kernel()
             await client.async_start_new_kernel_client()
-        except Exception as e:
+        except BaseException as e:
+            await _close_client(client)
+            if isinstance(e, asyncio.CancelledError):
+                raise
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to start kernel '{kernel_name}': {e}",
@@ -208,8 +232,10 @@ def create_notebooks_router(verify_api_key) -> APIRouter:
 
         try:
             await session.client.async_execute_cell(cell, req.cell_index)
+        except asyncio.CancelledError:
+            await _destroy_session(session_id)
+            raise
         except Exception as e:
-            session.busy = False
             # Return the error as a cell output rather than HTTP error
             return ExecuteCellResponse(
                 status="error",
@@ -223,7 +249,8 @@ def create_notebooks_router(verify_api_key) -> APIRouter:
                 ],
             )
 
-        session.busy = False
+        finally:
+            session.busy = False
         session.last_used = time.time()
 
         # Serialize outputs

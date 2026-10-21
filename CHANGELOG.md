@@ -4,11 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.14.2] - 2026-10-19
+
+### Fixed
+
+- Reduced memory use when reading and editing large text files. Reading just a few lines no longer loads every line into memory, which could previously crash the server even for a small response.
+- Reduced memory use when reading text from documents, uploading and viewing files, downloading folders as ZIP files, and previewing Word and PowerPoint files as PDFs. Temporary files are removed after sending or cancellation.
+- Reduced memory use when searching large folders or files with many matches, including when loading later pages of results. Matching lines are still returned in full.
+- Reading command output and removing old output from oversized logs no longer loads the entire log into memory. If saving output fails, such as when the disk is full, commands can still finish and release their resources instead of remaining marked as running and retaining memory.
+- Apps opened through forwarded ports now deliver live responses as they arrive. Previously, Open Terminal kept collecting the response in memory until it ended, so continuous updates could fail to appear and keep increasing memory use.
+- Fixed file operations and port checks getting stuck when several commands or terminals were open without producing output on Linux and macOS.
+- Fixed notebook sessions continuing to consume memory after startup failed or execution was cancelled. Shutting down Open Terminal now also stops its commands, terminals, and notebook sessions.
+- Fixed closed terminals leaving connections or programs running in the background, and large inputs to background commands being cut short or mixed together when sent at the same time.
+- Old command logs are now deleted after the configured retention period even when the finished command has already disappeared from the command list. Previously, those logs could remain on disk indefinitely.
+
+## [0.14.1] - 2026-10-16
 
 ### Added
 
-- In multi-user mode, you can now choose which users get Docker access. Set `OPEN_TERMINAL_DOCKER_ALLOWED_USERS` to a comma-separated list of usernames, and only those users are added to the Docker socket's group. When it is not set, every user gets access as before.
+- Command results now include the folder the command ran in, so assistants can see where each command started without running a separate command to check.
+
+### Fixed
+
+- Fixed file browsing in Open WebUI when Open Terminal runs directly on Windows. Opening a folder previously failed with a server error while checking whether its files could be edited.
 
 ## [0.14.0] - 2026-09-23
 
